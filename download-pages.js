@@ -701,8 +701,8 @@ ${result.html}`;
     console.log(" Test: Download Random Page");
     console.log("===========================================\n");
 
-    // Fetch a few pages from API to pick a random one
-    console.log("  Fetching some pages from API...\n");
+    // Use same approach as working harvester - no special headers, with retries
+    console.log("  Fetching random page from API...\n");
 
     const url = new URL(CONFIG.API_BASE);
     url.searchParams.set("action", "query");
@@ -711,62 +711,93 @@ ${result.html}`;
     url.searchParams.set("rnlimit", "1");
     url.searchParams.set("format", "json");
 
-    try {
-      const response = await fetch(url.toString(), {
-        headers: { "User-Agent": CONFIG.USER_AGENT }
-      });
+    let randomPage = null;
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+    // Retry logic like the working harvester
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        console.log(`  Attempt ${attempt}/5...`);
+        const response = await fetch(url.toString());
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        randomPage = data.query?.random?.[0];
+
+        if (randomPage) break;
+
+      } catch (error) {
+        console.log(`    Failed: ${error.message}`);
+        if (attempt < 5) {
+          const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000);
+          console.log(`    Retrying in ${delay/1000}s...`);
+          await sleep(delay);
+        }
       }
+    }
 
-      const data = await response.json();
-      const randomPage = data.query?.random?.[0];
+    if (!randomPage) {
+      console.log("\n  Could not get random page from API after 5 attempts.");
+      console.log("  Try again later or test with a specific page:");
+      console.log("    node download-pages.js test-page \"Iron Lump\"");
+      return;
+    }
 
-      if (!randomPage) {
-        console.log("  Could not get random page from API.");
-        return;
-      }
+    console.log(`\n  Random page selected:`);
+    console.log(`    Page ID: ${randomPage.id}`);
+    console.log(`    Title: ${randomPage.title}`);
 
-      console.log(`  Random page selected:`);
-      console.log(`    Page ID: ${randomPage.id}`);
-      console.log(`    Title: ${randomPage.title}`);
-      console.log(`    URL: ${this.downloader.buildPageUrl(randomPage.title)}`);
-      console.log("\n  Downloading...\n");
+    await this.downloadTestPage(randomPage.title, randomPage.id);
+  }
 
-      const result = await this.downloader.downloadPage(randomPage.title);
+  async testPage(title) {
+    console.log("\n===========================================");
+    console.log(` Test: Download "${title}"`);
+    console.log("===========================================\n");
 
-      if (result.success) {
-        // Save to test file
-        const filename = `TEST_${randomPage.id}_${sanitizeFilename(randomPage.title)}.html`;
-        const filepath = path.join(CONFIG.HTML_DIR, filename);
+    await this.downloadTestPage(title, 0);
+  }
 
-        const htmlWithMeta = `<!--
+  async downloadTestPage(title, pageid) {
+    const pageUrl = this.downloader.buildPageUrl(title);
+    console.log(`    URL: ${pageUrl}`);
+    console.log("\n  Downloading (with retries)...\n");
+
+    const result = await this.downloader.downloadPage(title);
+
+    if (result.success) {
+      // Save to test file
+      const filename = `TEST_${pageid}_${sanitizeFilename(title)}.html`;
+      const filepath = path.join(CONFIG.HTML_DIR, filename);
+
+      const htmlWithMeta = `<!--
   Wurmpedia Page Archive (TEST)
-  Page ID: ${randomPage.id}
-  Title: ${randomPage.title}
+  Page ID: ${pageid}
+  Title: ${title}
   URL: ${result.url}
   Downloaded: ${new Date().toISOString()}
 -->
 ${result.html}`;
 
-        ensureDir(CONFIG.HTML_DIR);
-        fs.writeFileSync(filepath, htmlWithMeta, "utf-8");
+      ensureDir(CONFIG.HTML_DIR);
+      fs.writeFileSync(filepath, htmlWithMeta, "utf-8");
 
-        console.log("  SUCCESS!");
-        console.log(`\n  File saved: ${filepath}`);
-        console.log(`  Size: ${(result.bytes / 1024).toFixed(1)} KB`);
-        console.log(`\n  First 500 chars of HTML:`);
-        console.log("  " + "-".repeat(50));
-        console.log(result.html.substring(0, 500).replace(/\n/g, "\n  "));
-        console.log("  " + "-".repeat(50));
-        console.log("\n  Test completed successfully!");
-      } else {
-        console.log(`  FAILED: ${result.error}`);
-      }
-
-    } catch (error) {
-      console.error(`  Error: ${error.message}`);
+      console.log("  SUCCESS!");
+      console.log(`\n  File saved: ${filepath}`);
+      console.log(`  Size: ${(result.bytes / 1024).toFixed(1)} KB`);
+      console.log(`\n  First 500 chars of HTML:`);
+      console.log("  " + "-".repeat(50));
+      console.log(result.html.substring(0, 500).replace(/\n/g, "\n  "));
+      console.log("  " + "-".repeat(50));
+      console.log("\n  Test completed successfully!");
+    } else {
+      console.log(`  FAILED: ${result.error}`);
+      console.log("\n  Tips:");
+      console.log("  - Check if wurmpedia.com is accessible in your browser");
+      console.log("  - Try again in a few minutes");
+      console.log("  - Try a specific page: node download-pages.js test-page \"Main Page\"");
     }
   }
 }
@@ -826,6 +857,18 @@ async function main() {
       await downloader.testRandom();
       break;
 
+    case "test-page": {
+      // Get page title from remaining args
+      const pageTitle = args.filter(a => !a.startsWith("--") && a !== "test-page").join(" ");
+      if (!pageTitle) {
+        console.log("\n  Usage: node download-pages.js test-page \"Page Title\"");
+        console.log("  Example: node download-pages.js test-page \"Iron Lump\"");
+      } else {
+        await downloader.testPage(pageTitle);
+      }
+      break;
+    }
+
     case "help":
     default:
       console.log(`
@@ -839,6 +882,7 @@ Usage: node download-pages.js [command] [options]
 Commands:
   download       Start or resume downloading pages (default)
   test           Download ONE random page (for testing)
+  test-page X    Download a specific page by title (e.g. "Iron Lump")
   retry          Retry previously failed pages
   status         Show download progress and statistics
   list           List downloaded pages
