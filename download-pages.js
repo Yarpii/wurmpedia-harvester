@@ -695,6 +695,80 @@ ${result.html}`;
     console.log("  Note: HTML files are NOT deleted. Delete them manually if needed.");
     console.log(`  HTML directory: ${CONFIG.HTML_DIR}`);
   }
+
+  async testRandom() {
+    console.log("\n===========================================");
+    console.log(" Test: Download Random Page");
+    console.log("===========================================\n");
+
+    // Fetch a few pages from API to pick a random one
+    console.log("  Fetching some pages from API...\n");
+
+    const url = new URL(CONFIG.API_BASE);
+    url.searchParams.set("action", "query");
+    url.searchParams.set("list", "random");
+    url.searchParams.set("rnnamespace", "0");
+    url.searchParams.set("rnlimit", "1");
+    url.searchParams.set("format", "json");
+
+    try {
+      const response = await fetch(url.toString(), {
+        headers: { "User-Agent": CONFIG.USER_AGENT }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      const randomPage = data.query?.random?.[0];
+
+      if (!randomPage) {
+        console.log("  Could not get random page from API.");
+        return;
+      }
+
+      console.log(`  Random page selected:`);
+      console.log(`    Page ID: ${randomPage.id}`);
+      console.log(`    Title: ${randomPage.title}`);
+      console.log(`    URL: ${this.downloader.buildPageUrl(randomPage.title)}`);
+      console.log("\n  Downloading...\n");
+
+      const result = await this.downloader.downloadPage(randomPage.title);
+
+      if (result.success) {
+        // Save to test file
+        const filename = `TEST_${randomPage.id}_${sanitizeFilename(randomPage.title)}.html`;
+        const filepath = path.join(CONFIG.HTML_DIR, filename);
+
+        const htmlWithMeta = `<!--
+  Wurmpedia Page Archive (TEST)
+  Page ID: ${randomPage.id}
+  Title: ${randomPage.title}
+  URL: ${result.url}
+  Downloaded: ${new Date().toISOString()}
+-->
+${result.html}`;
+
+        ensureDir(CONFIG.HTML_DIR);
+        fs.writeFileSync(filepath, htmlWithMeta, "utf-8");
+
+        console.log("  SUCCESS!");
+        console.log(`\n  File saved: ${filepath}`);
+        console.log(`  Size: ${(result.bytes / 1024).toFixed(1)} KB`);
+        console.log(`\n  First 500 chars of HTML:`);
+        console.log("  " + "-".repeat(50));
+        console.log(result.html.substring(0, 500).replace(/\n/g, "\n  "));
+        console.log("  " + "-".repeat(50));
+        console.log("\n  Test completed successfully!");
+      } else {
+        console.log(`  FAILED: ${result.error}`);
+      }
+
+    } catch (error) {
+      console.error(`  Error: ${error.message}`);
+    }
+  }
 }
 
 // ============================================================================
@@ -747,6 +821,11 @@ async function main() {
       downloader.clear();
       break;
 
+    case "test":
+    case "random":
+      await downloader.testRandom();
+      break;
+
     case "help":
     default:
       console.log(`
@@ -759,6 +838,7 @@ Usage: node download-pages.js [command] [options]
 
 Commands:
   download       Start or resume downloading pages (default)
+  test           Download ONE random page (for testing)
   retry          Retry previously failed pages
   status         Show download progress and statistics
   list           List downloaded pages
