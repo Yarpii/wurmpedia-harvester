@@ -1,0 +1,28 @@
+{
+  "name": "wurmpedia-harvester",
+  "version": "2.0.0",
+  "description": "Complete Wurmpedia harvester for crafting and cooking recipes",
+  "main": "harvest-wurmpedia.js",
+  "scripts": {
+    "harvest": "node harvest-wurmpedia.js harvest",
+    "pages": "node harvest-wurmpedia.js pages",
+    "content": "node harvest-wurmpedia.js content",
+    "recipes": "node harvest-wurmpedia.js recipes",
+    "resume": "node harvest-wurmpedia.js resume",
+    "stats": "node harvest-wurmpedia.js stats",
+    "export": "node harvest-wurmpedia.js export",
+    "clear": "node harvest-wurmpedia.js clear"
+  },
+  "keywords": [
+    "wurmpedia",
+    "wurm-online",
+    "wurm-unlimited",
+    "wiki-scraper",
+    "recipe-extractor"
+  ],
+  "author": "Yarpii",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
