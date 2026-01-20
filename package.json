@@ -11,7 +11,11 @@
     "resume": "node harvest-wurmpedia.js resume",
     "stats": "node harvest-wurmpedia.js stats",
     "export": "node harvest-wurmpedia.js export",
-    "clear": "node harvest-wurmpedia.js clear"
+    "clear": "node harvest-wurmpedia.js clear",
+    "download": "node download-pages.js download",
+    "download:status": "node download-pages.js status",
+    "download:retry": "node download-pages.js retry",
+    "download:slow": "node download-pages.js download --delay=5000"
   },
   "keywords": [
     "wurmpedia",
