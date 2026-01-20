@@ -15,7 +15,8 @@
     "download": "node download-pages.js download",
     "download:status": "node download-pages.js status",
     "download:retry": "node download-pages.js retry",
-    "download:slow": "node download-pages.js download --delay=5000"
+    "download:slow": "node download-pages.js download --delay=5000",
+    "download:test": "node download-pages.js test"
   },
   "keywords": [
     "wurmpedia",
