@@ -2,13 +2,14 @@
 
 /**
  * ============================================================================
- * Wurmpedia Full HTML Page Downloader v1.0
+ * Wurmpedia Full HTML Page Downloader v1.1
  * ============================================================================
  *
  * Downloads complete HTML pages from Wurmpedia for offline scraping.
  *
  * Features:
  * - Downloads full rendered HTML pages (not just API content)
+ * - Downloads all images and updates HTML to use local paths
  * - Very conservative rate limiting (3-5 seconds between requests)
  * - Checkpoint/resume system for interruptions
  * - Exponential backoff on errors
@@ -26,6 +27,7 @@
  * Options:
  *   --delay=N      Set delay between requests in ms (default: 3000)
  *   --limit=N      Only download N pages (for testing)
+ *   --no-images    Skip downloading images
  *
  * ============================================================================
  */
@@ -40,11 +42,13 @@ const path = require("path");
 const CONFIG = {
   // Base URLs
   WIKI_BASE: "https://wurmpedia.com/index.php",
+  WIKI_ROOT: "https://wurmpedia.com",
   API_BASE: "https://wurmpedia.com/api.php",
 
   // Directories
   DATA_DIR: path.join(__dirname, "data"),
   HTML_DIR: path.join(__dirname, "data", "html-pages"),
+  IMAGES_DIR: path.join(__dirname, "data", "images"),
   INDEX_FILE: path.join(__dirname, "data", "index.json"),
   CHECKPOINT_FILE: path.join(__dirname, "data", "download-checkpoint.json"),
 
@@ -52,6 +56,7 @@ const CONFIG = {
   DELAY_MS: 3000,              // 3 seconds between requests (default)
   MIN_DELAY_MS: 2000,          // Minimum 2 seconds
   MAX_DELAY_MS: 10000,         // Maximum 10 seconds
+  IMAGE_DELAY_MS: 500,         // 0.5 seconds between image downloads (faster, they're static)
 
   // Retry settings
   MAX_RETRIES: 5,
@@ -59,7 +64,7 @@ const CONFIG = {
   RETRY_MAX_DELAY_MS: 60000,   // Max 1 minute between retries
 
   // User agent - identify ourselves
-  USER_AGENT: "WurmpediaHarvester/1.0 (Community Project; Offline Scraping; Contact: github.com/Yarpii)",
+  USER_AGENT: "WurmpediaHarvester/1.1 (Community Project; Offline Scraping; Contact: github.com/Yarpii)",
 
   // Save checkpoint every N pages
   CHECKPOINT_INTERVAL: 10
@@ -79,6 +84,12 @@ function formatTime(seconds) {
   return `${(seconds / 3600).toFixed(1)}h`;
 }
 
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 function sanitizeFilename(title) {
   // Replace characters that are problematic in filenames
   return title
@@ -91,6 +102,62 @@ function sanitizeFilename(title) {
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+// Extract image URLs from HTML
+function extractImageUrls(html) {
+  const images = new Set();
+
+  // Match src attributes in img tags
+  const imgPattern = /<img[^>]+src=["']([^"']+)["']/gi;
+  let match;
+
+  while ((match = imgPattern.exec(html)) !== null) {
+    let src = match[1];
+
+    // Skip data URLs and external images
+    if (src.startsWith('data:')) continue;
+    if (src.includes('//') && !src.includes('wurmpedia.com')) continue;
+
+    // Convert relative URLs to absolute
+    if (src.startsWith('/')) {
+      src = CONFIG.WIKI_ROOT + src;
+    } else if (!src.startsWith('http')) {
+      src = CONFIG.WIKI_ROOT + '/' + src;
+    }
+
+    // Only include wurmpedia images
+    if (src.includes('wurmpedia.com')) {
+      images.add(src);
+    }
+  }
+
+  return Array.from(images);
+}
+
+// Convert image URL to local path
+function imageUrlToLocalPath(imageUrl) {
+  try {
+    const url = new URL(imageUrl);
+    // Get path after /images/ or just use the pathname
+    let imagePath = url.pathname;
+
+    // Clean up the path
+    if (imagePath.startsWith('/')) {
+      imagePath = imagePath.substring(1);
+    }
+
+    // Sanitize for filesystem
+    imagePath = imagePath
+      .replace(/[<>:"|?*]/g, "_")
+      .replace(/\\/g, "/");
+
+    return imagePath;
+  } catch (e) {
+    // Fallback: use hash of URL
+    const hash = imageUrl.split('/').pop() || 'image';
+    return `images/${sanitizeFilename(hash)}`;
   }
 }
 
@@ -337,6 +404,148 @@ class HtmlDownloader {
 }
 
 // ============================================================================
+// IMAGE DOWNLOADER
+// ============================================================================
+
+class ImageDownloader {
+  constructor() {
+    this.lastRequest = 0;
+    this.downloadedImages = new Set(); // Track already downloaded images
+    this.imageCache = {};              // Map URL -> local path
+    this.stats = {
+      downloaded: 0,
+      skipped: 0,
+      failed: 0,
+      bytes: 0
+    };
+  }
+
+  async rateLimit() {
+    const now = Date.now();
+    const elapsed = now - this.lastRequest;
+    if (elapsed < CONFIG.IMAGE_DELAY_MS) {
+      await sleep(CONFIG.IMAGE_DELAY_MS - elapsed);
+    }
+    this.lastRequest = Date.now();
+  }
+
+  // Load cache of already downloaded images
+  loadCache() {
+    const cacheFile = path.join(CONFIG.IMAGES_DIR, "_cache.json");
+    try {
+      if (fs.existsSync(cacheFile)) {
+        const data = JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
+        this.imageCache = data.cache || {};
+        this.downloadedImages = new Set(Object.keys(this.imageCache));
+      }
+    } catch (e) {
+      // Ignore cache errors
+    }
+  }
+
+  saveCache() {
+    const cacheFile = path.join(CONFIG.IMAGES_DIR, "_cache.json");
+    try {
+      ensureDir(CONFIG.IMAGES_DIR);
+      fs.writeFileSync(cacheFile, JSON.stringify({
+        cache: this.imageCache,
+        stats: this.stats,
+        updatedAt: new Date().toISOString()
+      }, null, 2));
+    } catch (e) {
+      // Ignore cache errors
+    }
+  }
+
+  async downloadImage(imageUrl) {
+    // Check if already downloaded
+    if (this.downloadedImages.has(imageUrl)) {
+      this.stats.skipped++;
+      return { success: true, localPath: this.imageCache[imageUrl], skipped: true };
+    }
+
+    await this.rateLimit();
+
+    try {
+      const response = await fetch(imageUrl);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const buffer = await response.arrayBuffer();
+      const localPath = imageUrlToLocalPath(imageUrl);
+      const fullPath = path.join(CONFIG.IMAGES_DIR, localPath);
+
+      // Ensure directory exists
+      ensureDir(path.dirname(fullPath));
+
+      // Write image file
+      fs.writeFileSync(fullPath, Buffer.from(buffer));
+
+      // Update cache
+      this.downloadedImages.add(imageUrl);
+      this.imageCache[imageUrl] = localPath;
+      this.stats.downloaded++;
+      this.stats.bytes += buffer.byteLength;
+
+      return { success: true, localPath, bytes: buffer.byteLength };
+
+    } catch (error) {
+      this.stats.failed++;
+      return { success: false, error: error.message };
+    }
+  }
+
+  async downloadImagesFromHtml(html) {
+    const imageUrls = extractImageUrls(html);
+
+    if (imageUrls.length === 0) {
+      return { html, imagesDownloaded: 0, imagesSkipped: 0, imagesFailed: 0 };
+    }
+
+    let modifiedHtml = html;
+    let downloaded = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const imageUrl of imageUrls) {
+      const result = await this.downloadImage(imageUrl);
+
+      if (result.success) {
+        // Replace URL in HTML with local path
+        const localPath = "../images/" + result.localPath;
+        modifiedHtml = modifiedHtml.split(imageUrl).join(localPath);
+
+        // Also replace URL-encoded version
+        const encodedUrl = imageUrl.replace(/ /g, "%20");
+        modifiedHtml = modifiedHtml.split(encodedUrl).join(localPath);
+
+        if (result.skipped) {
+          skipped++;
+        } else {
+          downloaded++;
+        }
+      } else {
+        failed++;
+      }
+    }
+
+    return {
+      html: modifiedHtml,
+      imagesDownloaded: downloaded,
+      imagesSkipped: skipped,
+      imagesFailed: failed,
+      totalImages: imageUrls.length
+    };
+  }
+
+  getStats() {
+    return this.stats;
+  }
+}
+
+// ============================================================================
 // PROGRESS DISPLAY
 // ============================================================================
 
@@ -381,14 +590,22 @@ class WurmpediaDownloader {
     this.options = {
       delay: CONFIG.DELAY_MS,
       limit: 0,
+      images: true,  // Download images by default
       ...options
     };
 
     this.pageIndex = new PageIndex();
     this.checkpoint = new Checkpoint();
     this.downloader = new HtmlDownloader(this.options.delay);
+    this.imageDownloader = new ImageDownloader();
 
     ensureDir(CONFIG.HTML_DIR);
+    ensureDir(CONFIG.IMAGES_DIR);
+
+    // Load image cache for resume
+    if (this.options.images) {
+      this.imageDownloader.loadCache();
+    }
   }
 
   async fetchPageList() {
@@ -515,12 +732,26 @@ class WurmpediaDownloader {
       process.exit(0);
     });
 
+    let totalImages = 0;
+    let totalImagesDownloaded = 0;
+
     for (const page of toDownload) {
       if (shuttingDown) break;
 
       const result = await this.downloader.downloadPage(page.title);
 
       if (result.success) {
+        let finalHtml = result.html;
+        let pageBytes = result.bytes;
+
+        // Download images if enabled
+        if (this.options.images) {
+          const imageResult = await this.imageDownloader.downloadImagesFromHtml(result.html);
+          finalHtml = imageResult.html;
+          totalImages += imageResult.totalImages || 0;
+          totalImagesDownloaded += imageResult.imagesDownloaded || 0;
+        }
+
         // Save HTML file
         const filename = `${page.pageid}_${sanitizeFilename(page.title)}.html`;
         const filepath = path.join(CONFIG.HTML_DIR, filename);
@@ -532,39 +763,61 @@ class WurmpediaDownloader {
   Title: ${page.title}
   URL: ${result.url}
   Downloaded: ${new Date().toISOString()}
+  Images: ${this.options.images ? 'localized' : 'remote'}
 -->
-${result.html}`;
+${finalHtml}`;
 
         fs.writeFileSync(filepath, htmlWithMeta, "utf-8");
 
-        this.checkpoint.markDownloaded(page.pageid, result.bytes);
+        this.checkpoint.markDownloaded(page.pageid, pageBytes);
         downloaded++;
-        totalBytes += result.bytes;
+        totalBytes += pageBytes;
       } else {
         this.checkpoint.markFailed(page.pageid, result.error);
         failed++;
         console.log(`\n    Failed: ${page.title} - ${result.error}`);
       }
 
-      progress.update(downloaded + failed, `| ${(totalBytes / 1024 / 1024).toFixed(1)} MB`);
+      const imgStats = this.imageDownloader.getStats();
+      const extraInfo = this.options.images
+        ? `| ${formatBytes(totalBytes)} | img: ${imgStats.downloaded}`
+        : `| ${formatBytes(totalBytes)}`;
+      progress.update(downloaded + failed, extraInfo);
 
-      // Save checkpoint periodically
+      // Save checkpoint and image cache periodically
       if ((downloaded + failed) % CONFIG.CHECKPOINT_INTERVAL === 0) {
         this.checkpoint.save();
+        if (this.options.images) {
+          this.imageDownloader.saveCache();
+        }
       }
     }
 
     progress.done();
     this.checkpoint.save();
 
+    // Save final image cache
+    if (this.options.images) {
+      this.imageDownloader.saveCache();
+    }
+
     // Summary
     console.log("\n===========================================");
     console.log(" Download Complete!");
     console.log("===========================================");
-    console.log(`  Downloaded: ${downloaded} pages`);
-    console.log(`  Failed: ${failed} pages`);
-    console.log(`  Total size: ${(totalBytes / 1024 / 1024).toFixed(1)} MB`);
-    console.log(`  Saved to: ${CONFIG.HTML_DIR}`);
+    console.log(`  Pages downloaded: ${downloaded}`);
+    console.log(`  Pages failed: ${failed}`);
+    console.log(`  HTML size: ${formatBytes(totalBytes)}`);
+    console.log(`  HTML saved to: ${CONFIG.HTML_DIR}`);
+
+    if (this.options.images) {
+      const imgStats = this.imageDownloader.getStats();
+      console.log(`\n  Images downloaded: ${imgStats.downloaded}`);
+      console.log(`  Images skipped (cached): ${imgStats.skipped}`);
+      console.log(`  Images failed: ${imgStats.failed}`);
+      console.log(`  Images size: ${formatBytes(imgStats.bytes)}`);
+      console.log(`  Images saved to: ${CONFIG.IMAGES_DIR}`);
+    }
 
     if (failed > 0) {
       console.log(`\n  Failed pages are saved in checkpoint.`);
@@ -666,6 +919,22 @@ ${result.html}`;
       const files = fs.readdirSync(CONFIG.HTML_DIR).filter(f => f.endsWith(".html"));
       console.log(`\n  HTML files on disk: ${files.length}`);
     }
+
+    // Check images
+    if (fs.existsSync(CONFIG.IMAGES_DIR)) {
+      const cacheFile = path.join(CONFIG.IMAGES_DIR, "_cache.json");
+      if (fs.existsSync(cacheFile)) {
+        try {
+          const cache = JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
+          const imgStats = cache.stats || {};
+          console.log(`\n  Images downloaded: ${imgStats.downloaded || 0}`);
+          console.log(`  Images size: ${formatBytes(imgStats.bytes || 0)}`);
+          console.log(`  Images cached: ${Object.keys(cache.cache || {}).length}`);
+        } catch (e) {
+          // Ignore
+        }
+      }
+    }
   }
 
   listDownloaded() {
@@ -763,11 +1032,30 @@ ${result.html}`;
   async downloadTestPage(title, pageid) {
     const pageUrl = this.downloader.buildPageUrl(title);
     console.log(`    URL: ${pageUrl}`);
-    console.log("\n  Downloading (with retries)...\n");
+    console.log(`    Images: ${this.options.images ? 'will download' : 'skipped'}`);
+    console.log("\n  Downloading page (with retries)...\n");
 
     const result = await this.downloader.downloadPage(title);
 
     if (result.success) {
+      let finalHtml = result.html;
+      let imageInfo = "";
+
+      // Download images if enabled
+      if (this.options.images) {
+        console.log("  Downloading images...\n");
+        const imageResult = await this.imageDownloader.downloadImagesFromHtml(result.html);
+        finalHtml = imageResult.html;
+
+        imageInfo = `\n  Images found: ${imageResult.totalImages || 0}`;
+        imageInfo += `\n  Images downloaded: ${imageResult.imagesDownloaded || 0}`;
+        imageInfo += `\n  Images cached: ${imageResult.imagesSkipped || 0}`;
+        imageInfo += `\n  Images failed: ${imageResult.imagesFailed || 0}`;
+
+        // Save image cache
+        this.imageDownloader.saveCache();
+      }
+
       // Save to test file
       const filename = `TEST_${pageid}_${sanitizeFilename(title)}.html`;
       const filepath = path.join(CONFIG.HTML_DIR, filename);
@@ -778,20 +1066,26 @@ ${result.html}`;
   Title: ${title}
   URL: ${result.url}
   Downloaded: ${new Date().toISOString()}
+  Images: ${this.options.images ? 'localized' : 'remote'}
 -->
-${result.html}`;
+${finalHtml}`;
 
       ensureDir(CONFIG.HTML_DIR);
       fs.writeFileSync(filepath, htmlWithMeta, "utf-8");
 
       console.log("  SUCCESS!");
       console.log(`\n  File saved: ${filepath}`);
-      console.log(`  Size: ${(result.bytes / 1024).toFixed(1)} KB`);
+      console.log(`  Size: ${formatBytes(result.bytes)}`);
+      console.log(imageInfo);
       console.log(`\n  First 500 chars of HTML:`);
       console.log("  " + "-".repeat(50));
-      console.log(result.html.substring(0, 500).replace(/\n/g, "\n  "));
+      console.log(finalHtml.substring(0, 500).replace(/\n/g, "\n  "));
       console.log("  " + "-".repeat(50));
       console.log("\n  Test completed successfully!");
+
+      if (this.options.images) {
+        console.log(`\n  Images saved to: ${CONFIG.IMAGES_DIR}`);
+      }
     } else {
       console.log(`  FAILED: ${result.error}`);
       console.log("\n  Tips:");
@@ -809,7 +1103,8 @@ ${result.html}`;
 function parseArgs(args) {
   const options = {
     delay: CONFIG.DELAY_MS,
-    limit: 0
+    limit: 0,
+    images: true  // Download images by default
   };
 
   for (const arg of args) {
@@ -817,6 +1112,10 @@ function parseArgs(args) {
       options.delay = parseInt(arg.split("=")[1]) || CONFIG.DELAY_MS;
     } else if (arg.startsWith("--limit=")) {
       options.limit = parseInt(arg.split("=")[1]) || 0;
+    } else if (arg === "--no-images") {
+      options.images = false;
+    } else if (arg === "--images") {
+      options.images = true;
     }
   }
 
@@ -872,27 +1171,29 @@ async function main() {
     case "help":
     default:
       console.log(`
-Wurmpedia HTML Page Downloader v1.0
+Wurmpedia HTML Page Downloader v1.1
 
-Downloads complete HTML pages from Wurmpedia for offline scraping.
+Downloads complete HTML pages AND images from Wurmpedia for offline scraping.
 Very conservative rate limiting to respect the wiki servers.
 
 Usage: node download-pages.js [command] [options]
 
 Commands:
   download       Start or resume downloading pages (default)
-  test           Download ONE random page (for testing)
+  test           Download ONE random page with images (for testing)
   test-page X    Download a specific page by title (e.g. "Iron Lump")
   retry          Retry previously failed pages
   status         Show download progress and statistics
   list           List downloaded pages
-  clear          Clear checkpoint (does not delete HTML files)
+  clear          Clear checkpoint (does not delete HTML/image files)
   help           Show this help
 
 Options:
   --delay=N      Delay between requests in milliseconds (default: 3000)
                  Minimum: 2000ms, Maximum: 10000ms
   --limit=N      Only download N pages (useful for testing)
+  --no-images    Skip downloading images (faster, smaller)
+  --images       Download images (default)
 
 Examples:
   node download-pages.js download              # Start/resume downloading
